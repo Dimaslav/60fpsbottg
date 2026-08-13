@@ -7,7 +7,8 @@ from pathlib import Path
 import imageio_ffmpeg
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
-FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "300"))
+# Увеличенный таймаут для тяжелого minterpolate
+FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "1800"))
 
 
 def setup_logging() -> logging.Logger:
@@ -47,50 +48,65 @@ def convert_to_60fps(input_file: str, output_file: str) -> None:
         "-y",
         "-hide_banner",
         "-nostdin",
-        "-i",
-        input_file,
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-        "-vf",
-        "minterpolate=fps=60",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-preset",
-        "medium",
-        "-crf",
-        "18",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-movflags",
-        "+faststart",
+        "-i", input_file,
+        "-map", "0:v:0",
+        "-map", "0:a?",
+        "-vf", "minterpolate=fps=60",  # Для теста можно поменять на "fps=60"
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "veryfast",         # Ускоренный пресет
+        "-crf", "18",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
         output_file,
     ]
 
-    # Захватываем и stdout, и stderr
     result = subprocess.run(
         cmd,
         timeout=FFMPEG_TIMEOUT,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
+        errors="replace", # Защита от UnicodeDecodeError
     )
 
     if result.returncode != 0:
-        # Склеиваем вывод ошибки
-        err = (result.stderr + "\n" + result.stdout).strip()
-        if not err:
-            err = f"FFmpeg exited with code {result.returncode} but produced no output."
-        raise RuntimeError(err)
+        error = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"FFmpeg exit code {result.returncode}:\n"
+            f"{error[-4000:] if error else 'no output'}"
+        )
 
 
 def worker_main(job_queue, result_queue) -> None:
     logger = setup_logging()
     logger.info("Worker process started")
+
+    # --- ДИАГНОСТИЧЕСКИЙ БЛОК ---
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        
+        probe = subprocess.run(
+            [ffmpeg_exe, "-version"],
+            capture_output=True, text=True, timeout=10, errors="replace"
+        )
+        logger.info("FFmpeg version:\n%s", probe.stdout)
+
+        probe = subprocess.run(
+            [ffmpeg_exe, "-hide_banner", "-filters"],
+            capture_output=True, text=True, timeout=10, errors="replace"
+        )
+        logger.info("minterpolate available: %s", "minterpolate" in probe.stdout)
+
+        probe = subprocess.run(
+            [ffmpeg_exe, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10, errors="replace"
+        )
+        logger.info("libx264 available: %s", "libx264" in probe.stdout)
+    except Exception:
+        logger.exception("Could not inspect FFmpeg")
+    # ----------------------------
 
     while True:
         job = job_queue.get()
@@ -127,19 +143,7 @@ def worker_main(job_queue, result_queue) -> None:
                 }
             )
 
-        except FileNotFoundError:
-            msg = "FFmpeg not found in worker container"
-            logger.exception("Job %s failed: %s", job_id, msg)
-            result_queue.put(
-                {
-                    "job_id": job_id,
-                    "ok": False,
-                    "error": msg,
-                }
-            )
-
         except Exception as exc:
-            # Теперь сюда прилетит RuntimeError с полным текстом ошибки FFmpeg
             msg = str(exc)
             if len(msg) > 2000:
                 msg = msg[:2000]
