@@ -4,6 +4,8 @@ import subprocess
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import imageio_ffmpeg
+
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "300"))
 
@@ -38,8 +40,11 @@ def setup_logging() -> logging.Logger:
 
 
 def convert_to_60fps(input_file: str, output_file: str) -> None:
+    # Получаем путь к исполняемому файлу ffmpeg из пакета
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+
     cmd = [
-        "ffmpeg",
+        ffmpeg_exe,  # <-- Заменили "ffmpeg" на путь из библиотеки
         "-y",
         "-hide_banner",
         "-loglevel",
