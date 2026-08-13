@@ -40,15 +40,12 @@ def setup_logging() -> logging.Logger:
 
 
 def convert_to_60fps(input_file: str, output_file: str) -> None:
-    # Получаем путь к исполняемому файлу ffmpeg из пакета
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
     cmd = [
-        ffmpeg_exe,  # <-- Заменили "ffmpeg" на путь из библиотеки
+        ffmpeg_exe,
         "-y",
         "-hide_banner",
-        "-loglevel",
-        "error",
         "-nostdin",
         "-i",
         input_file,
@@ -75,14 +72,20 @@ def convert_to_60fps(input_file: str, output_file: str) -> None:
         output_file,
     ]
 
-    subprocess.run(
+    # Захватываем и stdout, и stderr
+    result = subprocess.run(
         cmd,
-        check=True,
         timeout=FFMPEG_TIMEOUT,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
     )
+
+    if result.returncode != 0:
+        # Склеиваем вывод ошибки
+        err = (result.stderr + "\n" + result.stdout).strip()
+        if not err:
+            err = f"FFmpeg exited with code {result.returncode} but produced no output."
+        raise RuntimeError(err)
 
 
 def worker_main(job_queue, result_queue) -> None:
@@ -124,20 +127,6 @@ def worker_main(job_queue, result_queue) -> None:
                 }
             )
 
-        except subprocess.CalledProcessError as exc:
-            err = (exc.stderr or "ffmpeg error").strip()
-            if len(err) > 2000:
-                err = err[:2000]
-
-            logger.exception("Job %s failed: %s", job_id, err)
-            result_queue.put(
-                {
-                    "job_id": job_id,
-                    "ok": False,
-                    "error": err,
-                }
-            )
-
         except FileNotFoundError:
             msg = "FFmpeg not found in worker container"
             logger.exception("Job %s failed: %s", job_id, msg)
@@ -150,7 +139,10 @@ def worker_main(job_queue, result_queue) -> None:
             )
 
         except Exception as exc:
+            # Теперь сюда прилетит RuntimeError с полным текстом ошибки FFmpeg
             msg = str(exc)
+            if len(msg) > 2000:
+                msg = msg[:2000]
             logger.exception("Job %s unexpected error", job_id)
             result_queue.put(
                 {
