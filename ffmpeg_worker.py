@@ -9,15 +9,16 @@ import imageio_ffmpeg
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "1800"))
 
+logger = setup_logging()
 
 def setup_logging() -> logging.Logger:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    logger = logging.getLogger("ffmpeg_worker")
-    logger.setLevel(logging.INFO)
+    log = logging.getLogger("ffmpeg_worker")
+    log.setLevel(logging.INFO)
 
-    if logger.handlers:
-        return logger
+    if log.handlers:
+        return log
 
     fmt = logging.Formatter(
         "%(asctime)s | %(processName)s | %(levelname)s | %(name)s | %(message)s"
@@ -34,40 +35,62 @@ def setup_logging() -> logging.Logger:
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(fmt)
 
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    return logger
+    log.addHandler(file_handler)
+    log.addHandler(console_handler)
+    return log
+
+
+def log_system_resources() -> None:
+    """Пытается прочитать лимиты памяти cgroup для диагностики OOM."""
+    try:
+        with open("/proc/meminfo", "r") as f:
+            logger.info("Memory info before FFmpeg:\n%s", f.read())
+    except Exception:
+        pass
+
+    for path in [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory.current",
+        "/sys/fs/cgroup/memory.events",
+    ]:
+        try:
+            with open(path) as f:
+                logger.info("%s = %s", path, f.read().strip())
+        except Exception:
+            pass
 
 
 def convert_to_60fps(input_file: str, output_file: str) -> None:
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
-    # Легкие настройки для диагностики
+    # Параметры для снижения потребления памяти
     cmd = [
         ffmpeg_exe,
         "-y",
         "-hide_banner",
         "-nostdin",
         "-i", input_file,
-        
+
         "-map", "0:v:0",
         "-map", "0:a?",
-        
-        # Уменьшаем размер до 640px по ширине, чтобы сэкономить RAM
-        "-vf", "scale=640:-2,minterpolate=fps=60",
-        
+
+        # Тонкая настройка minterpolate для экономии RAM
+        "-vf", "minterpolate=fps=60:mi_mode=mci:mc_mode=obmc:me_mode=bidir:me=hexbs:search_param=8",
+
         "-c:v", "libx264",
-        "-preset", "ultrafast",  # Максимально быстрый пресет
-        "-crf", "23",
+        "-preset", "ultrafast",
+        "-crf", "21",
         "-pix_fmt", "yuv420p",
-        "-threads", "1",         # Ограничиваем 1 потоком CPU
-        
+        "-threads", "1",  # Ограничиваем потоки
+
         "-c:a", "aac",
         "-b:a", "128k",
-        
+
         "-movflags", "+faststart",
         output_file,
     ]
+
+    log_system_resources()
 
     result = subprocess.run(
         cmd,
@@ -80,15 +103,22 @@ def convert_to_60fps(input_file: str, output_file: str) -> None:
 
     if result.returncode != 0:
         stderr = (result.stderr or "").strip()
+        full_error = f"FFmpeg exit code: {result.returncode}\n{stderr[-6000:] or 'FFmpeg produced no stderr'}"
+        
+        # Пишем полный лог в файл
+        logger.error(full_error)
 
-        raise RuntimeError(
-            f"FFmpeg exit code: {result.returncode}\n"
-            f"{stderr[-6000:] or 'FFmpeg produced no stderr'}"
-        )
+        if result.returncode == -9:
+            # Пользовательское сообщение для OOM
+            raise RuntimeError(
+                "FFmpeg был остановлен сервером (SIGKILL). "
+                "Скорее всего, превышен лимит оперативной памяти хостинга."
+            )
+        else:
+            raise RuntimeError(full_error)
 
 
 def worker_main(job_queue, result_queue) -> None:
-    logger = setup_logging()
     logger.info("Worker process started")
 
     while True:
