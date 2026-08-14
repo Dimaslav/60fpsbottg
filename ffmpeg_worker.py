@@ -8,8 +8,9 @@ import imageio_ffmpeg
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "1800"))
-# Целевая высота видео (1080 = FullHD, 720 = HD). Ширина подстроится автоматически.
-TARGET_HEIGHT = int(os.getenv("TARGET_HEIGHT", "1080"))
+# Поставим 720p, так как 1080p на 1ГБ RAM почти гарантированно упадет.
+# Если хотите попробовать 1080p, поменяйте на 1080, но будьте готовы к OOM (-9).
+TARGET_HEIGHT = int(os.getenv("TARGET_HEIGHT", "720"))
 
 
 def setup_logging() -> logging.Logger:
@@ -41,7 +42,6 @@ def setup_logging() -> logging.Logger:
     return log
 
 
-# Сначала объявляем функцию, потом уже вызываем её!
 logger = setup_logging()
 
 
@@ -68,10 +68,13 @@ def log_system_resources() -> None:
 def convert_to_60fps(input_file: str, output_file: str) -> None:
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
-    # Формируем строку фильтров:
-    # 1. scale=-2:1080:flags=lanczos — увеличиваем до 1080p (ширина -2 значит "авто с четным числом")
-    # 2. minterpolate — интерполяция до 60 кадров
-    video_filter = f"scale=-2:{TARGET_HEIGHT}:flags=lanczos,minterpolate=fps=60:mi_mode=mci:mc_mode=obmc:me_mode=bidir:me=hexbs:search_param=8"
+    # ОПТИМИЗАЦИЯ ДЛЯ 1GB RAM:
+    # 1. Сначала делаем minterpolate на ИСХОДНОМ разрешении (экономит кучу памяти)
+    # 2. Только потом увеличиваем размер (scale)
+    video_filter = (
+        f"minterpolate=fps=60:mi_mode=mci:mc_mode=obmc:me_mode=bidir:me=hexbs:search_param=8,"
+        f"scale=-2:{TARGET_HEIGHT}:flags=lanczos"
+    )
 
     cmd = [
         ffmpeg_exe,
@@ -86,10 +89,10 @@ def convert_to_60fps(input_file: str, output_file: str) -> None:
         "-vf", video_filter,
 
         "-c:v", "libx264",
-        "-preset", "ultrafast",  # Максимально быстрый пресет для экономии CPU/RAM
-        "-crf", "21",
+        "-preset", "ultrafast",
+        "-crf", "23",
         "-pix_fmt", "yuv420p",
-        "-threads", "1",         # Ограничиваем потоки
+        "-threads", "1",
 
         "-c:a", "aac",
         "-b:a", "128k",
@@ -113,14 +116,12 @@ def convert_to_60fps(input_file: str, output_file: str) -> None:
         stderr = (result.stderr or "").strip()
         full_error = f"FFmpeg exit code: {result.returncode}\n{stderr[-6000:] or 'FFmpeg produced no stderr'}"
         
-        # Пишем полный лог в файл
         logger.error(full_error)
 
         if result.returncode == -9:
-            # Пользовательское сообщение для OOM
             raise RuntimeError(
-                "Серверу не хватило оперативной памяти для обработки этого видео. "
-                "Попробуйте видео меньшего разрешения или обратитесь к администратору."
+                "Серверу не хватило оперативной памяти (OOM). "
+                "Видео слишком тяжелое для текущего тарифа."
             )
         else:
             raise RuntimeError(full_error)
