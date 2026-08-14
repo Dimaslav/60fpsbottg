@@ -8,8 +8,9 @@ import imageio_ffmpeg
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "1800"))
+# Целевая высота видео (1080 = FullHD, 720 = HD). Ширина подстроится автоматически.
+TARGET_HEIGHT = int(os.getenv("TARGET_HEIGHT", "1080"))
 
-logger = setup_logging()
 
 def setup_logging() -> logging.Logger:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -40,6 +41,10 @@ def setup_logging() -> logging.Logger:
     return log
 
 
+# Сначала объявляем функцию, потом уже вызываем её!
+logger = setup_logging()
+
+
 def log_system_resources() -> None:
     """Пытается прочитать лимиты памяти cgroup для диагностики OOM."""
     try:
@@ -63,7 +68,11 @@ def log_system_resources() -> None:
 def convert_to_60fps(input_file: str, output_file: str) -> None:
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
-    # Параметры для снижения потребления памяти
+    # Формируем строку фильтров:
+    # 1. scale=-2:1080:flags=lanczos — увеличиваем до 1080p (ширина -2 значит "авто с четным числом")
+    # 2. minterpolate — интерполяция до 60 кадров
+    video_filter = f"scale=-2:{TARGET_HEIGHT}:flags=lanczos,minterpolate=fps=60:mi_mode=mci:mc_mode=obmc:me_mode=bidir:me=hexbs:search_param=8"
+
     cmd = [
         ffmpeg_exe,
         "-y",
@@ -74,14 +83,13 @@ def convert_to_60fps(input_file: str, output_file: str) -> None:
         "-map", "0:v:0",
         "-map", "0:a?",
 
-        # Тонкая настройка minterpolate для экономии RAM
-        "-vf", "minterpolate=fps=60:mi_mode=mci:mc_mode=obmc:me_mode=bidir:me=hexbs:search_param=8",
+        "-vf", video_filter,
 
         "-c:v", "libx264",
-        "-preset", "ultrafast",
+        "-preset", "ultrafast",  # Максимально быстрый пресет для экономии CPU/RAM
         "-crf", "21",
         "-pix_fmt", "yuv420p",
-        "-threads", "1",  # Ограничиваем потоки
+        "-threads", "1",         # Ограничиваем потоки
 
         "-c:a", "aac",
         "-b:a", "128k",
@@ -111,8 +119,8 @@ def convert_to_60fps(input_file: str, output_file: str) -> None:
         if result.returncode == -9:
             # Пользовательское сообщение для OOM
             raise RuntimeError(
-                "FFmpeg был остановлен сервером (SIGKILL). "
-                "Скорее всего, превышен лимит оперативной памяти хостинга."
+                "Серверу не хватило оперативной памяти для обработки этого видео. "
+                "Попробуйте видео меньшего разрешения или обратитесь к администратору."
             )
         else:
             raise RuntimeError(full_error)
