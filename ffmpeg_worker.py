@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 import subprocess
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -18,6 +19,8 @@ def setup_logging() -> logging.Logger:
 
     logger = logging.getLogger("ffmpeg_worker")
     logger.setLevel(logging.INFO)
+    # без этого каждая запись дублируется в root-логгер, настроенный bot.py
+    logger.propagate = False
 
     if logger.handlers:
         return logger
@@ -141,6 +144,12 @@ def recompress_if_oversized(output_file: str, logger: logging.Logger) -> None:
 
 def worker_main(job_queue, result_queue) -> None:
     logger = setup_logging()
+
+    if shutil.which(FFMPEG_BIN) is None:
+        logger.error(
+            "ffmpeg не найден (%r): задачи будут завершаться ошибкой", FFMPEG_BIN
+        )
+
     logger.info("Worker process started")
 
     while True:
@@ -202,7 +211,7 @@ def worker_main(job_queue, result_queue) -> None:
             )
 
         except FileNotFoundError:
-            msg = "FFmpeg not found"
+            msg = f"FFmpeg not found ({FFMPEG_BIN})"
             logger.exception("Job %s failed: %s", job_id, msg)
             result_queue.put(
                 {

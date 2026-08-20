@@ -45,6 +45,7 @@ python bot.py
 | `MAX_FILE_SIZE_BYTES` | `52428800` | Максимальный размер входного видео (50 МБ) |
 | `MAX_UPLOAD_BYTES` | `47185920` | Максимальный размер результата (45 МБ) |
 | `FFMPEG_TIMEOUT` | `300` | Таймаут одного запуска FFmpeg, сек |
+| `FFMPEG_BIN` | `ffmpeg` | Имя или полный путь к бинарнику ffmpeg (в Windows — путь к `ffmpeg.exe`) |
 | `FFMPEG_PRESET` | `fast` | Пресет libx264 для основного прохода |
 | `FFMPEG_CRF` | `20` | CRF основного прохода (меньше — качество выше) |
 | `FALLBACK_CRF` | `28` | CRF автопережатия при превышении лимита |
@@ -56,10 +57,20 @@ python bot.py
 
 ## Docker
 
+Образ ставит FFmpeg через apt (`/usr/bin/ffmpeg`), переменная `FFMPEG_BIN` в контейнере не нужна.
+
 ```bash
 docker build -t tg60fps .
 docker run --rm -e BOT_TOKEN="123456:ABC-DEF..." tg60fps
 ```
+
+Важно:
+
+- после изменений кода пересобирай образ (`docker build`): `docker restart` старый код не обновляет;
+- не передавай в контейнер `FFMPEG_BIN` из Windows `.env` (там путь вида `C:/Users/...`,
+  которого в Linux-контейнере нет) — при `--env-file .env` убери или переопредели эту переменную;
+- образ основан на `python:3.12-slim`; если используешь свой — установи в него `ffmpeg`,
+  иначе задачи будут падать с `FFmpeg not found`.
 
 ## Замечания по производительности
 
