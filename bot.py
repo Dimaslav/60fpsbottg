@@ -4,6 +4,7 @@ import multiprocessing as mp
 import os
 import queue as sync_queue
 import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -13,7 +14,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.error import TelegramError
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from ffmpeg_worker import worker_main
 
@@ -23,9 +30,33 @@ TOKEN = os.getenv("BOT_TOKEN")
 QUEUE_MAXSIZE = int(os.getenv("QUEUE_MAXSIZE", "10"))
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_BYTES", str(50 * 1024 * 1024)))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(45 * 1024 * 1024)))
-JOB_ROOT = Path(os.getenv("JOB_ROOT", "/tmp/tg60fps_jobs"))
+FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "300"))
+# Худший случай ожидания в очереди: QUEUE_MAXSIZE задач по FFMPEG_TIMEOUT секунд + запас.
+JOB_TIMEOUT_SECONDS = int(
+    os.getenv("JOB_TIMEOUT_SECONDS", str(QUEUE_MAXSIZE * FFMPEG_TIMEOUT + 300))
+)
+WORKER_CHECK_INTERVAL = int(os.getenv("WORKER_CHECK_INTERVAL", "5"))
+JOB_ROOT = Path(os.getenv("JOB_ROOT", str(Path(tempfile.gettempdir()) / "tg60fps_jobs")))
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STALE_JOB_TTL_SECONDS = int(os.getenv("STALE_JOB_TTL_SECONDS", str(24 * 60 * 60)))
+
+
+def _parse_allowed_ids(raw: str) -> set[int]:
+    ids: set[int] = set()
+    for part in raw.replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            raise RuntimeError(
+                f"ALLOWED_USER_IDS содержит недопустимое значение: {part!r}"
+            ) from None
+    return ids
+
+
+# Пусто — доступ всем. Иначе только перечисленным пользователям.
+ALLOWED_USER_IDS = _parse_allowed_ids(os.getenv("ALLOWED_USER_IDS", ""))
 
 active_users: set[int] = set()
 active_users_lock = threading.Lock()
@@ -78,6 +109,10 @@ class VideoDocumentFilter(filters.MessageFilter):
 VIDEO_DOCUMENT = VideoDocumentFilter()
 
 
+def is_allowed(user_id: int) -> bool:
+    return not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS
+
+
 def acquire_user_slot(user_id: int) -> bool:
     with active_users_lock:
         if user_id in active_users:
@@ -116,6 +151,16 @@ def resolve_future(future: asyncio.Future, result: dict) -> None:
         future.set_result(result)
 
 
+def fail_pending_jobs(error: str) -> None:
+    """Завершает ошибкой все ожидающие задачи. Вызывать только из event loop."""
+    with pending_lock:
+        jobs = list(pending_jobs.items())
+        pending_jobs.clear()
+
+    for job_id, future in jobs:
+        resolve_future(future, {"job_id": job_id, "ok": False, "error": error})
+
+
 def result_listener(loop, result_queue, stop_event) -> None:
     listener_logger = logging.getLogger("bot.listener")
 
@@ -144,6 +189,37 @@ def result_listener(loop, result_queue, stop_event) -> None:
             listener_logger.warning("Event loop is closed, dropping result for job %s", job_id)
 
 
+def spawn_worker(app) -> "mp.process.BaseProcess":
+    worker = mp.get_context("spawn").Process(
+        target=worker_main,
+        args=(app.bot_data["job_queue"], app.bot_data["result_queue"]),
+    )
+    worker.start()
+    return worker
+
+
+async def watch_worker(app) -> None:
+    """Перезапускает воркер, если тот упал, и завершает ошибкой зависшие задачи."""
+    while True:
+        await asyncio.sleep(WORKER_CHECK_INTERVAL)
+
+        worker = app.bot_data.get("worker_process")
+        if worker is None or worker.is_alive():
+            continue
+
+        logger.error(
+            "Worker process died (exitcode=%s), failing pending jobs and restarting",
+            worker.exitcode,
+        )
+        fail_pending_jobs("Рабочий процесс упал, задача прервана. Попробуй ещё раз.")
+
+        try:
+            app.bot_data["worker_process"] = spawn_worker(app)
+            logger.info("Worker restarted")
+        except Exception:
+            logger.exception("Failed to restart worker")
+
+
 async def post_init(app):
     cleanup_stale_job_dirs()
 
@@ -152,11 +228,10 @@ async def post_init(app):
     result_queue = ctx.Queue()
     stop_event = threading.Event()
 
-    worker = ctx.Process(
-        target=worker_main,
-        args=(job_queue, result_queue),
-    )
-    worker.start()
+    app.bot_data["job_queue"] = job_queue
+    app.bot_data["result_queue"] = result_queue
+    app.bot_data["stop_event"] = stop_event
+    app.bot_data["worker_process"] = spawn_worker(app)
 
     loop = asyncio.get_running_loop()
     listener = threading.Thread(
@@ -166,17 +241,18 @@ async def post_init(app):
         name="result-listener",
     )
     listener.start()
-
-    app.bot_data["job_queue"] = job_queue
-    app.bot_data["result_queue"] = result_queue
-    app.bot_data["worker_process"] = worker
-    app.bot_data["stop_event"] = stop_event
     app.bot_data["listener_thread"] = listener
+
+    app.bot_data["watchdog_task"] = asyncio.create_task(watch_worker(app))
 
     logger.info("Worker started. queue maxsize=%s", QUEUE_MAXSIZE)
 
 
 async def post_shutdown(app):
+    watchdog = app.bot_data.get("watchdog_task")
+    if watchdog:
+        watchdog.cancel()
+
     stop_event = app.bot_data.get("stop_event")
     job_queue = app.bot_data.get("job_queue")
     worker = app.bot_data.get("worker_process")
@@ -197,6 +273,8 @@ async def post_shutdown(app):
             logger.warning("Worker did not stop in time, terminating")
             worker.terminate()
 
+    fail_pending_jobs("Бот останавливается, задача прервана.")
+
     if listener and listener.is_alive():
         listener.join(timeout=2)
 
@@ -214,6 +292,11 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     user_id = message.from_user.id
+
+    if not is_allowed(user_id):
+        await message.reply_text("Нет доступа к этому боту.")
+        return
+
     if not acquire_user_slot(user_id):
         await message.reply_text("У тебя уже есть активная задача. Подожди немного.")
         return
@@ -279,7 +362,14 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except TelegramError:
             pass
 
-        result = await future
+        try:
+            result = await asyncio.wait_for(future, timeout=JOB_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            # future уже отменён; поздний результат воркера безопасно отбросится
+            await message.reply_text(
+                "Обработка заняла слишком много времени. Попробуй видео покороче."
+            )
+            return
 
         if not result.get("ok"):
             await message.reply_text(
@@ -292,7 +382,11 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         if output_path.stat().st_size > MAX_UPLOAD_BYTES:
-            await message.reply_text("Результат слишком большой для отправки.")
+            max_mb = MAX_UPLOAD_BYTES // (1024 * 1024)
+            await message.reply_text(
+                f"Результат слишком большой для отправки (лимит {max_mb} МБ). "
+                "Попробуй видео покороче или меньшего разрешения."
+            )
             return
 
         try:
@@ -307,14 +401,9 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 supports_streaming=True,
             )
 
-        try:
-            await status.delete()
-        except TelegramError:
-            pass
-
     except FileNotFoundError:
-        logger.exception("FFmpeg not found")
-        await message.reply_text("FFmpeg не установлен на сервере.")
+        logger.exception("File not found during processing")
+        await message.reply_text("Не удалось найти файл при обработке. Попробуй отправить видео заново.")
     except TelegramError:
         logger.exception("Telegram error")
         try:
@@ -340,6 +429,9 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 def main() -> None:
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
+
+    if shutil.which("ffmpeg") is None:
+        logger.warning("ffmpeg не найден в PATH: обработка видео не будет работать")
 
     app = (
         ApplicationBuilder()

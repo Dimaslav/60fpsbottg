@@ -4,23 +4,22 @@ import subprocess
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-import imageio_ffmpeg
-
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
-FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "1800"))
-# Поставим 720p, так как 1080p на 1ГБ RAM почти гарантированно упадет.
-# Если хотите попробовать 1080p, поменяйте на 1080, но будьте готовы к OOM (-9).
-TARGET_HEIGHT = int(os.getenv("TARGET_HEIGHT", "720"))
+FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "300"))
+FFMPEG_PRESET = os.getenv("FFMPEG_PRESET", "fast")
+FFMPEG_CRF = os.getenv("FFMPEG_CRF", "20")
+FALLBACK_CRF = os.getenv("FALLBACK_CRF", "28")
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(45 * 1024 * 1024)))
 
 
 def setup_logging() -> logging.Logger:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    log = logging.getLogger("ffmpeg_worker")
-    log.setLevel(logging.INFO)
+    logger = logging.getLogger("ffmpeg_worker")
+    logger.setLevel(logging.INFO)
 
-    if log.handlers:
-        return log
+    if logger.handlers:
+        return logger
 
     fmt = logging.Formatter(
         "%(asctime)s | %(processName)s | %(levelname)s | %(name)s | %(message)s"
@@ -37,97 +36,110 @@ def setup_logging() -> logging.Logger:
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(fmt)
 
-    log.addHandler(file_handler)
-    log.addHandler(console_handler)
-    return log
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    return logger
 
 
-logger = setup_logging()
-
-
-def log_system_resources() -> None:
-    """Пытается прочитать лимиты памяти cgroup для диагностики OOM."""
-    try:
-        with open("/proc/meminfo", "r") as f:
-            logger.info("Memory info before FFmpeg:\n%s", f.read())
-    except Exception:
-        pass
-
-    for path in [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory.current",
-        "/sys/fs/cgroup/memory.events",
-    ]:
-        try:
-            with open(path) as f:
-                logger.info("%s = %s", path, f.read().strip())
-        except Exception:
-            pass
+def _run_ffmpeg(cmd: list[str]) -> None:
+    subprocess.run(
+        cmd,
+        check=True,
+        timeout=FFMPEG_TIMEOUT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
 
 
 def convert_to_60fps(input_file: str, output_file: str) -> None:
-    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-
-    # ОПТИМИЗАЦИЯ ДЛЯ 1GB RAM:
-    # 1. Сначала делаем minterpolate на ИСХОДНОМ разрешении (экономит кучу памяти)
-    # 2. Только потом увеличиваем размер (scale)
-    video_filter = (
-        f"minterpolate=fps=60:mi_mode=mci:mc_mode=obmc:me_mode=bidir:me=hexbs:search_param=8,"
-        f"scale=-2:{TARGET_HEIGHT}:flags=lanczos"
-    )
-
     cmd = [
-        ffmpeg_exe,
+        "ffmpeg",
         "-y",
         "-hide_banner",
+        "-loglevel",
+        "error",
         "-nostdin",
-        "-i", input_file,
-
-        "-map", "0:v:0",
-        "-map", "0:a?",
-
-        "-vf", video_filter,
-
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        "-threads", "1",
-
-        "-c:a", "aac",
-        "-b:a", "128k",
-
-        "-movflags", "+faststart",
+        "-i",
+        input_file,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-vf",
+        "minterpolate=fps=60",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-preset",
+        FFMPEG_PRESET,
+        "-crf",
+        FFMPEG_CRF,
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
         output_file,
     ]
+    _run_ffmpeg(cmd)
 
-    log_system_resources()
 
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=FFMPEG_TIMEOUT,
-        text=True,
-        errors="replace",
+def recompress_if_oversized(output_file: str, logger: logging.Logger) -> None:
+    """Если результат не влезает в лимит отправки — пережимает сильнее.
+
+    Кодирование идёт из уже готового 60 FPS-файла, так что повторная
+    интерполяция кадров не нужна и второй проход заметно дешевле первого.
+    """
+    size = os.path.getsize(output_file)
+    if size <= MAX_UPLOAD_BYTES:
+        return
+
+    logger.info(
+        "Output %.1f MB exceeds %.1f MB, recompressing with crf=%s",
+        size / (1024 * 1024),
+        MAX_UPLOAD_BYTES / (1024 * 1024),
+        FALLBACK_CRF,
     )
 
-    if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        full_error = f"FFmpeg exit code: {result.returncode}\n{stderr[-6000:] or 'FFmpeg produced no stderr'}"
-        
-        logger.error(full_error)
-
-        if result.returncode == -9:
-            raise RuntimeError(
-                "Серверу не хватило оперативной памяти (OOM). "
-                "Видео слишком тяжелое для текущего тарифа."
-            )
-        else:
-            raise RuntimeError(full_error)
+    tmp_file = output_file + ".small.mp4"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        output_file,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-preset",
+        "veryfast",
+        "-crf",
+        FALLBACK_CRF,
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        tmp_file,
+    ]
+    _run_ffmpeg(cmd)
+    os.replace(tmp_file, output_file)
 
 
 def worker_main(job_queue, result_queue) -> None:
+    logger = setup_logging()
     logger.info("Worker process started")
 
     while True:
@@ -141,9 +153,18 @@ def worker_main(job_queue, result_queue) -> None:
         input_path = job["input_path"]
         output_path = job["output_path"]
 
+        logger.info("Job %s started", job_id)
+
         try:
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
             convert_to_60fps(input_path, output_path)
+
+            try:
+                recompress_if_oversized(output_path, logger)
+            except Exception:
+                logger.exception(
+                    "Job %s fallback recompression failed, keeping original output", job_id
+                )
 
             result_queue.put(
                 {
@@ -165,10 +186,33 @@ def worker_main(job_queue, result_queue) -> None:
                 }
             )
 
+        except subprocess.CalledProcessError as exc:
+            err = (exc.stderr or "ffmpeg error").strip()
+            if len(err) > 2000:
+                err = err[:2000]
+
+            logger.exception("Job %s failed: %s", job_id, err)
+            result_queue.put(
+                {
+                    "job_id": job_id,
+                    "ok": False,
+                    "error": err,
+                }
+            )
+
+        except FileNotFoundError:
+            msg = "FFmpeg not found"
+            logger.exception("Job %s failed: %s", job_id, msg)
+            result_queue.put(
+                {
+                    "job_id": job_id,
+                    "ok": False,
+                    "error": msg,
+                }
+            )
+
         except Exception as exc:
             msg = str(exc)
-            if len(msg) > 2000:
-                msg = msg[:2000]
             logger.exception("Job %s unexpected error", job_id)
             result_queue.put(
                 {
