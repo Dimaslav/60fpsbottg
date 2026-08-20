@@ -430,8 +430,11 @@ def main() -> None:
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
 
-    if shutil.which("ffmpeg") is None:
-        logger.warning("ffmpeg не найден в PATH: обработка видео не будет работать")
+    if shutil.which(os.getenv("FFMPEG_BIN", "ffmpeg")) is None:
+        logger.warning(
+            "ffmpeg не найден в PATH: обработка видео не будет работать. "
+            "Установи ffmpeg или укажи полный путь в FFMPEG_BIN (.env)"
+        )
 
     app = (
         ApplicationBuilder()

@@ -5,6 +5,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "300"))
 FFMPEG_PRESET = os.getenv("FFMPEG_PRESET", "fast")
 FFMPEG_CRF = os.getenv("FFMPEG_CRF", "20")
@@ -54,7 +55,7 @@ def _run_ffmpeg(cmd: list[str]) -> None:
 
 def convert_to_60fps(input_file: str, output_file: str) -> None:
     cmd = [
-        "ffmpeg",
+        FFMPEG_BIN,
         "-y",
         "-hide_banner",
         "-loglevel",
@@ -106,7 +107,7 @@ def recompress_if_oversized(output_file: str, logger: logging.Logger) -> None:
 
     tmp_file = output_file + ".small.mp4"
     cmd = [
-        "ffmpeg",
+        FFMPEG_BIN,
         "-y",
         "-hide_banner",
         "-loglevel",
